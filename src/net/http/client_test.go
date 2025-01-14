@@ -346,7 +346,7 @@ func TestPostRedirects(t *testing.T) {
 		`POST /?code=307&next=303,308,302 "c307"`,
 		`POST /?code=303&next=308,302 "c307"`,
 		`GET /?code=308&next=302 ""`,
-		`GET /?code=302 "c307"`,
+		`GET /?code=302 ""`,
 		`GET / ""`,
 		`POST /?code=308&next=302,301 "c308"`,
 		`POST /?code=302&next=301 "c308"`,
@@ -376,7 +376,7 @@ func TestDeleteRedirects(t *testing.T) {
 		`DELETE /?code=301&next=302,308 "c301"`,
 		`GET /?code=302&next=308 ""`,
 		`GET /?code=308 ""`,
-		`GET / "c301"`,
+		`GET / ""`,
 		`DELETE /?code=302&next=302 "c302"`,
 		`GET /?code=302 ""`,
 		`GET / ""`,
@@ -385,7 +385,7 @@ func TestDeleteRedirects(t *testing.T) {
 		`DELETE /?code=307&next=301,308,303,302,304 "c307"`,
 		`DELETE /?code=301&next=308,303,302,304 "c307"`,
 		`GET /?code=308&next=303,302,304 ""`,
-		`GET /?code=303&next=302,304 "c307"`,
+		`GET /?code=303&next=302,304 ""`,
 		`GET /?code=302&next=304 ""`,
 		`GET /?code=304 ""`,
 		`DELETE /?code=308&next=307 "c308"`,
@@ -751,7 +751,7 @@ func testStreamingGet(t *testing.T, mode testMode) {
 	var buf [10]byte
 	for _, str := range []string{"i", "am", "also", "known", "as", "comet"} {
 		say <- str
-		n, err := io.ReadFull(res.Body, buf[0:len(str)])
+		n, err := io.ReadFull(res.Body, buf[:len(str)])
 		if err != nil {
 			t.Fatalf("ReadFull on %q: %v", str, err)
 		}
@@ -946,7 +946,7 @@ func testResponseSetsTLSConnectionState(t *testing.T, mode testMode) {
 
 	c := ts.Client()
 	tr := c.Transport.(*Transport)
-	tr.TLSClientConfig.CipherSuites = []uint16{tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA}
+	tr.TLSClientConfig.CipherSuites = []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}
 	tr.TLSClientConfig.MaxVersion = tls.VersionTLS12 // to get to pick the cipher suite
 	tr.Dial = func(netw, addr string) (net.Conn, error) {
 		return net.Dial(netw, ts.Listener.Addr().String())
@@ -959,7 +959,7 @@ func testResponseSetsTLSConnectionState(t *testing.T, mode testMode) {
 	if res.TLS == nil {
 		t.Fatal("Response didn't set TLS Connection State.")
 	}
-	if got, want := res.TLS.CipherSuite, tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA; got != want {
+	if got, want := res.TLS.CipherSuite, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256; got != want {
 		t.Errorf("TLS Cipher Suite = %d; want %d", got, want)
 	}
 }
@@ -1249,6 +1249,9 @@ func testClientTimeout(t *testing.T, mode testMode) {
 		} else if !ne.Timeout() {
 			t.Errorf("net.Error.Timeout = false; want true")
 		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("ReadAll error = %q; expected some context.DeadlineExceeded", err)
+		}
 		if got := ne.Error(); !strings.Contains(got, "(Client.Timeout") {
 			if runtime.GOOS == "windows" && strings.HasPrefix(runtime.GOARCH, "arm") {
 				testenv.SkipFlaky(t, 43120)
@@ -1291,6 +1294,9 @@ func testClientTimeout_Headers(t *testing.T, mode testMode) {
 	}
 	if !ne.Timeout() {
 		t.Error("net.Error.Timeout = false; want true")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("ReadAll error = %q; expected some context.DeadlineExceeded", err)
 	}
 	if got := ne.Error(); !strings.Contains(got, "Client.Timeout exceeded") {
 		if runtime.GOOS == "windows" && strings.HasPrefix(runtime.GOARCH, "arm") {
@@ -1711,6 +1717,7 @@ func TestShouldCopyHeaderOnRedirect(t *testing.T) {
 		{"authorization", "http://foo.com/", "https://foo.com/", true},
 		{"authorization", "http://foo.com:1234/", "http://foo.com:4321/", true},
 		{"www-authenticate", "http://foo.com/", "http://bar.com/", false},
+		{"authorization", "http://foo.com/", "http://[::1%25.foo.com]/", false},
 
 		// But subdomains should work:
 		{"www-authenticate", "http://foo.com/", "http://foo.com/", true},
@@ -1931,21 +1938,25 @@ func TestClientCloseIdleConnections(t *testing.T) {
 	}
 }
 
+type testRoundTripper func(*Request) (*Response, error)
+
+func (t testRoundTripper) RoundTrip(req *Request) (*Response, error) {
+	return t(req)
+}
+
 func TestClientPropagatesTimeoutToContext(t *testing.T) {
-	errDial := errors.New("not actually dialing")
 	c := &Client{
 		Timeout: 5 * time.Second,
-		Transport: &Transport{
-			DialContext: func(ctx context.Context, netw, addr string) (net.Conn, error) {
-				deadline, ok := ctx.Deadline()
-				if !ok {
-					t.Error("no deadline")
-				} else {
-					t.Logf("deadline in %v", deadline.Sub(time.Now()).Round(time.Second/10))
-				}
-				return nil, errDial
-			},
-		},
+		Transport: testRoundTripper(func(req *Request) (*Response, error) {
+			ctx := req.Context()
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Error("no deadline")
+			} else {
+				t.Logf("deadline in %v", deadline.Sub(time.Now()).Round(time.Second/10))
+			}
+			return nil, errors.New("not actually making a request")
+		}),
 	}
 	c.Get("https://example.tld/")
 }
@@ -1991,6 +2002,9 @@ func testClientDoCanceledVsTimeout(t *testing.T, mode testMode) {
 			}
 			if g, w := ue.Err, wantErr; g != w {
 				t.Errorf("url.Error.Err = %v; want %v", g, w)
+			}
+			if got := errors.Is(err, context.DeadlineExceeded); got != wantIsTimeout {
+				t.Errorf("errors.Is(err, context.DeadlineExceeded) = %v, want %v", got, wantIsTimeout)
 			}
 		})
 	}
