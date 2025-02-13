@@ -7,8 +7,11 @@ package os
 import (
 	"internal/bytealg"
 	"internal/poll"
+	"internal/stringslite"
 	"io"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -20,21 +23,22 @@ func fixLongPath(path string) string {
 
 // file is the real representation of *File.
 // The extra level of indirection ensures that no clients of os
-// can overwrite this data, which could cause the finalizer
+// can overwrite this data, which could cause the cleanup
 // to close the wrong file descriptor.
 type file struct {
 	fdmu       poll.FDMutex
 	fd         int
 	name       string
-	dirinfo    *dirInfo // nil unless directory being read
-	appendMode bool     // whether file is opened for appending
+	dirinfo    atomic.Pointer[dirInfo] // nil unless directory being read
+	appendMode bool                    // whether file is opened for appending
+	cleanup    runtime.Cleanup         // cleanup closes the file when no longer referenced
 }
 
 // Fd returns the integer Plan 9 file descriptor referencing the open file.
 // If f is closed, the file descriptor becomes invalid.
-// If f is garbage collected, a finalizer may close the file descriptor,
-// making it invalid; see runtime.SetFinalizer for more information on when
-// a finalizer might be run. On Unix systems this will cause the SetDeadline
+// If f is garbage collected, a cleanup may close the file descriptor,
+// making it invalid; see [runtime.AddCleanup] for more information on when
+// a cleanup might be run. On Unix systems this will cause the [File.SetDeadline]
 // methods to stop working.
 //
 // As an alternative, see the f.SyscallConn method.
@@ -54,12 +58,13 @@ func NewFile(fd uintptr, name string) *File {
 		return nil
 	}
 	f := &File{&file{fd: fdi, name: name}}
-	runtime.SetFinalizer(f.file, (*file).close)
+	f.cleanup = runtime.AddCleanup(f, func(f *file) { f.close() }, f.file)
 	return f
 }
 
 // Auxiliary information if the File describes a directory
 type dirInfo struct {
+	mu   sync.Mutex
 	buf  [syscall.STATMAX]byte // buffer for directory I/O
 	nbuf int                   // length of buf; return value from Read
 	bufp int                   // location of next record in buf.
@@ -139,6 +144,10 @@ func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	return NewFile(uintptr(fd), name), nil
 }
 
+func openDirNolog(name string) (*File, error) {
+	return openFileNolog(name, O_RDONLY, 0)
+}
+
 // Close closes the File, rendering it unusable for I/O.
 // On files that support SetDeadline, any pending I/O operations will
 // be canceled and return immediately with an ErrClosed error.
@@ -160,8 +169,9 @@ func (file *file) close() error {
 
 	err := file.decref()
 
-	// no need for a finalizer anymore
-	runtime.SetFinalizer(file, nil)
+	// There is no need for a cleanup at this point. File must be alive at the point
+	// where cleanup.stop is called.
+	file.cleanup.Stop()
 	return err
 }
 
@@ -345,11 +355,9 @@ func (f *File) seek(offset int64, whence int) (ret int64, err error) {
 		return 0, err
 	}
 	defer f.decref()
-	if f.dirinfo != nil {
-		// Free cached dirinfo, so we allocate a new one if we
-		// access this file as a directory again. See #35767 and #37161.
-		f.dirinfo = nil
-	}
+	// Free cached dirinfo, so we allocate a new one if we
+	// access this file as a directory again. See #35767 and #37161.
+	f.dirinfo.Store(nil)
 	return syscall.Seek(f.fd, offset, whence)
 }
 
@@ -382,14 +390,9 @@ func Remove(name string) error {
 	return nil
 }
 
-// hasPrefix from the strings package.
-func hasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
-}
-
 func rename(oldname, newname string) error {
 	dirname := oldname[:bytealg.LastIndexByteString(oldname, '/')+1]
-	if hasPrefix(newname, dirname) {
+	if stringslite.HasPrefix(newname, dirname) {
 		newname = newname[len(dirname):]
 	} else {
 		return &LinkError{"rename", oldname, newname, ErrInvalid}
@@ -614,5 +617,9 @@ func newRawConn(file *File) (*rawConn, error) {
 }
 
 func ignoringEINTR(fn func() error) error {
+	return fn()
+}
+
+func ignoringEINTR2[T any](fn func() (T, error)) (T, error) {
 	return fn()
 }
