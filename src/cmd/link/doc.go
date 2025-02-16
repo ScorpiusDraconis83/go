@@ -47,12 +47,18 @@ Flags:
 		Link with C/C++ address sanitizer support.
 	-aslr
 		Enable ASLR for buildmode=c-shared on windows (default true).
+	-bindnow
+		Mark a dynamically linked ELF object for immediate function binding (default false).
 	-buildid id
 		Record id as Go toolchain build id.
 	-buildmode mode
 		Set build mode (default exe).
 	-c
 		Dump call graphs.
+	-checklinkname=value
+		If value is 0, all go:linkname directives are permitted.
+		If value is 1 (the default), only a known set of widely-used
+		linknames are permitted.
 	-compressdwarf
 		Compress DWARF if possible (default true).
 	-cpuprofile file
@@ -66,6 +72,8 @@ Flags:
 		system tools now assume the presence of the header.
 	-dumpdep
 		Dump symbol dependency graph.
+	-e
+		No limit on number of errors reported.
 	-extar ar
 		Set the external archive program (default "ar").
 		Used only for -buildmode=c-archive.
@@ -112,6 +120,7 @@ Flags:
 		Link with race detection libraries.
 	-s
 		Omit the symbol table and debug information.
+		Implies the -w flag, which can be negated with -w=0.
 	-tmpdir dir
 		Write temporary files to dir.
 		Temporary files are only used in external linking mode.
